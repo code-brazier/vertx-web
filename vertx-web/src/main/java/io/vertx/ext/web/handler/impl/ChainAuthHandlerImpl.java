@@ -1,9 +1,6 @@
 package io.vertx.ext.web.handler.impl;
 
-import io.vertx.core.AsyncResult;
-import io.vertx.core.Future;
-import io.vertx.core.Handler;
-import io.vertx.core.Promise;
+import io.vertx.core.*;
 import io.vertx.core.internal.logging.Logger;
 import io.vertx.core.internal.logging.LoggerFactory;
 import io.vertx.ext.auth.User;
@@ -15,21 +12,25 @@ import io.vertx.ext.web.handler.HttpException;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.atomic.AtomicInteger;
 
 public class ChainAuthHandlerImpl extends AuthenticationHandlerImpl<AuthenticationProvider> implements ChainAuthHandler {
 
   private static final Logger LOG = LoggerFactory.getLogger(ChainAuthHandler.class);
 
-  private static final String HANDLER_IDX = "__vertx.auth.chain.idx";
+  private static final String HANDLER_KEY_PREFIX = "__vertx.auth.chain.idx.";
+  private static final AtomicInteger HANDLER_KEY_SEQ = new AtomicInteger();
 
   private final List<AuthenticationHandlerInternal> handlers = new ArrayList<>();
   private final boolean all;
+  private final String chainAuthHandlerKey;
 
   private int willRedirect = -1;
 
   public ChainAuthHandlerImpl(boolean all) {
     super(null);
     this.all = all;
+    this.chainAuthHandlerKey = HANDLER_KEY_PREFIX + HANDLER_KEY_SEQ.getAndIncrement();
   }
 
   @Override
@@ -63,19 +64,15 @@ public class ChainAuthHandlerImpl extends AuthenticationHandlerImpl<Authenticati
     }
   }
 
-  private void iterate(final int idx, final RoutingContext ctx, User result, Throwable exception, Handler<AsyncResult<User>> handler) {
+  private void iterate(final int idx, final RoutingContext ctx, User result, Throwable exception, Completable<User> handler) {
     // stop condition
     if (idx >= handlers.size()) {
       if (all) {
         // no more providers, if the call is signaling an error we fail as the last handler failed
-        if (exception == null) {
-          handler.handle(Future.succeededFuture(result));
-        } else {
-          handler.handle(Future.failedFuture(exception));
-        }
+        handler.complete(result, exception);
       } else {
         // no more providers, means that we failed to find a provider capable of performing this operation
-        handler.handle(Future.failedFuture(exception));
+        handler.complete(null, exception);
       }
       return;
     }
@@ -106,7 +103,7 @@ public class ChainAuthHandlerImpl extends AuthenticationHandlerImpl<Authenticati
           }
           // the error is not a validation exception, so we abort regardless
         }
-        handler.handle(Future.failedFuture(err));
+        handler.complete(null, err);
       })
       .onSuccess(user -> {
       if (all) {
@@ -115,8 +112,8 @@ public class ChainAuthHandlerImpl extends AuthenticationHandlerImpl<Authenticati
         iterate(idx + 1, ctx, user, null, handler);
       } else {
         // a single success is enough to signal the end of the validation
-        ctx.put(HANDLER_IDX, idx);
-        handler.handle(Future.succeededFuture(user));
+        ctx.put(chainAuthHandlerKey, idx);
+        handler.complete(user, null);
       }
     });
   }
@@ -139,11 +136,10 @@ public class ChainAuthHandlerImpl extends AuthenticationHandlerImpl<Authenticati
 
   @Override
   public void postAuthentication(RoutingContext ctx) {
-    if (all) {
-      // Can't invoke post-processing for all handlers
+    Integer idx;
+    if (all || (idx = ctx.get(chainAuthHandlerKey)) == null) {
       ctx.next();
     } else {
-      int idx = ctx.get(HANDLER_IDX);
       handlers.get(idx).postAuthentication(ctx);
     }
   }
